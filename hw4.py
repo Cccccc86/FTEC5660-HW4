@@ -18,69 +18,547 @@ import time
 import traceback
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.documents import Document
 from langchain_deepseek import ChatDeepSeek
+from rank_bm25 import BM25Okapi
 
 load_dotenv()
 
 
-# =============================================================================
-# Your code: add imports, constants and helper functions here.
-# =============================================================================
+_known_companies: set[str] = set()
+
+_YEAR_IN_QUERY = re.compile(r"(?i)\b(?:FY\s*[-–]?\s*)?((?:19|20)\d{2})\b")
+_CALL_QUERY = re.compile(r"\b(?:earnings|conference|results|fourth[- ]quarter|q[1-4])[- ]+call\b", re.I)
+_RESEARCH_QUERY = re.compile(
+    r"\b(?:broker(?:age)?|equity research|research report|results review|"
+    r"target price|price target|investment rating|recommendation|"
+    r"forecast(?:s|ed)?|consensus estimate)\b|"
+    r"\brating\b[^?;]*\b(?:give[sn]?|gave|assign(?:s|ed)?|set[st]?|from)\b",
+    re.I,
+)
+_COMPARISON_QUERY = re.compile(
+    r"\b(?:which\s+(?:company|firm|business|of)|compare|versus|vs)\b|"
+    r"\b(?:which|did)\b[^?;]*\b(?:higher|lower|more|less|greater|fewer)\b",
+    re.I,
+)
+
+# Case identifies names absent from the library, while names actually seen in
+# the corpus can also be matched when a question is written in lower case.
+_NAME_WORD = (
+    r"(?!(?:Who|What|Which|Where|When|How|Did|Does|Do|Is|Are|Was|Were|Has|Have|"
+    r"According|In|On|At|For|Between|"
+    r"Compared|Compare|From|USD|HKD|EUR|FY\d{4}|FY|Q[1-4])\b)"
+    r"[A-Z][^\W_]*(?:[-'][A-Z0-9][^\W_]*)*"
+)
+_PROPER_NAME = re.compile(
+    rf"(?<![\w'-]){_NAME_WORD}(?:(?:\s+|\s*&\s*|\s+of\s+|\s+of the\s+){_NAME_WORD})*"
+)
+_QUERY_SUFFIX = re.compile(r"(?:,?\s+(?:Inc|Corp|Corporation|Co|Ltd|Limited|PLC|LLC)\.?)+$", re.I)
+_POSSESSIVE = re.compile(r"^\.?'(?:s\b|(?!\w))", re.I)
+_COMPANY_SUBJECT = re.compile(
+    r"^\.?\s+(?:report(?:s|ed)?|hold(?:s)?|held|earn(?:s|ed)?|generat(?:e|es|ed)|"
+    r"disclos(?:e|es|ed)|announc(?:e|es|ed)|record(?:s|ed)?|post(?:s|ed)?|"
+    r"incur(?:s|red)?|pay(?:s)?|paid|spend|spent|hav(?:e|ing)|has|had|is|was|were|"
+    r"audited|located|headquartered)\b",
+    re.I,
+)
+_BROKER_ACTION = re.compile(
+    r"^\s+(?:forecast|estimate|project|predict|assign|set|give|rate|recommend|"
+    r"publish|cover|upgrade|downgrade)(?:s|d|ed)?\b", re.I
+)
 
 
-def table_to_text(table_html: str) -> str:
-    """Task 1.1: turn one HTML <table> into text that keeps every value with its row and its column.
-
-    Put each value on a line (at most 400 characters) together with its row label and its column
-    header, e.g. "Revenue | 2025: 2,710.4 | 2024: 2,629.1", one table row per line, keep the text of
-    every cell unchanged, and include the caption (it holds the unit) in the output. Do not call the
-    LLM here.
-    """
-    ### YOUR CODE HERE
-    return ""
+def _query_name_key(name: str) -> str:
+    return " ".join(_QUERY_SUFFIX.sub("", name).casefold().split())
 
 
-def chunk_document(file_name: str, html: str) -> list[Document]:
-    """Task 1.2: split one document into chunks of at most MAX_CHUNK_CHARS characters.
+def _query_mentions(question: str) -> list[tuple[int, int, str, bool]]:
+    """Find candidate names and mark those supported by the corpus metadata."""
+    known_keys = {_query_name_key(name) for name in _known_companies}
+    mentions = []
+    for match in _PROPER_NAME.finditer(question):
+        name = match.group()
+        mentions.append((match.start(), match.end(), name, _query_name_key(name) in known_keys))
 
-    Every chunk needs the metadata "source" (= file_name), "company", "fiscal_year" (an int) and
-    "doc_type" (one of DOC_TYPES). Do not call the LLM here.
-    """
-    ### YOUR CODE HERE
-    return []
+    for key in sorted(known_keys):
+        if not key:
+            continue
+        words = r"\s+".join(re.escape(word) for word in key.split())
+        for match in re.finditer(rf"(?<!\w){words}(?!\w)", question, re.I):
+            if any(start <= match.start() and end >= match.end() for start, end, *_ in mentions):
+                continue
+            mentions.append((match.start(), match.end(), match.group(), True))
+    return sorted(mentions)
+
+
+def _is_company_mention(
+    question: str, start: int, end: int, known: bool, doc_type: str, comparison: bool
+) -> bool:
+    left, right = question[:start], question[end:]
+    if re.search(r"\b(?:audited|reviewed)\s+by\s*$", left, re.I):
+        return False
+    if doc_type == "research_report":
+        attributed = re.search(r"\b(?:according to|(?:reported|published|issued) by)\s*$", left, re.I)
+        if _BROKER_ACTION.match(right) or attributed:
+            return False
+        if _POSSESSIVE.match(right) and re.search(
+            r"^\.?'(?:s\b)?\s*(?:(?:FY\s*)?\d{4}\s+)?(?:results review|research report)\b|"
+            r"^\.?'(?:s\b)?\s*[^,?;]{0,60}\b(?:forecast|estimate|rating|recommendation|target price)\s+for\b",
+            right, re.I,
+        ):
+            return False
+
+    if known or _POSSESSIVE.match(right) or _COMPANY_SUBJECT.match(right):
+        return True
+    if comparison and (
+        re.search(r"(?:[:,(]|\b(?:or|and|of|than|versus|vs|did|compare)\b\.?)\s*$", left, re.I)
+        and re.match(r"\s*(?:[?.,;)]|$|\b(?:or|and|versus|vs)\b)", right, re.I)
+    ):
+        return True
+    return bool(re.search(
+        r"\b(?:for|of|at|did|does|do|audited|give|gives|gave|rate|rates|rated|cover|covers)\s*$",
+        left, re.I,
+    ) and re.match(r"^\s*(?:[?.,;]|$|\b(?:in|as|at|on|for|during|from|before|after)\b)", right, re.I))
 
 
 def parse_query(question: str) -> dict:
-    """Task 2.2: {"companies": [names], "fiscal_year": int or None, "doc_type": one of DOC_TYPES}.
+    """Identify the companies as worded, named fiscal year, and requested document type."""
+    question = unicodedata.normalize("NFKC", question).replace("’", "'")
+    year = _YEAR_IN_QUERY.search(question)
+    if _CALL_QUERY.search(question):
+        doc_type = "earnings_call"
+    elif _RESEARCH_QUERY.search(question):
+        doc_type = "research_report"
+    else:
+        doc_type = "annual_report"
 
-    The rules for each field are under Task 2.2 in the handout. You may use make_llm() here.
-    """
-    ### YOUR CODE HERE
-    return {}
+    companies: dict[str, str] = {}
+    comparison = bool(_COMPARISON_QUERY.search(question))
+    for start, end, name, known in _query_mentions(question):
+        if _is_company_mention(question, start, end, known, doc_type, comparison):
+            key = _query_name_key(name)
+            if key:
+                companies.setdefault(key, name)
+    return {
+        "companies": list(companies.values()),
+        "fiscal_year": int(year.group(1)) if year else None,
+        "doc_type": doc_type,
+    }
 
 
-def build_index(chunks: list[Document]) -> Any:
-    """Task 2: index the chunks of the whole corpus (the output of chunk_document), once per run.
-
-    Return anything retrieve() needs: a BM25 or TF-IDF index, the chunks grouped by metadata, ...
-    """
-    ### YOUR CODE HERE
-    return None
+def _visible_text(tag) -> str:
+    return " ".join(tag.get_text(" ", strip=True).split()) if tag else ""
 
 
-def retrieve(index: Any, question: str) -> list[Document]:
-    """Tasks 2 and 3: at most MAX_RETRIEVED of the chunks given to build_index, best first.
+def _row_cells(row):
+    return row.find_all(["th", "td"], recursive=False)
 
-    Return [] when the corpus cannot answer the question: the generator then answers NOT_FOUND.
-    """
-    ### YOUR CODE HERE
-    return []
+
+def table_to_text(table_html: str) -> str:
+    """Read each table row with its own label, column labels and original values."""
+    table = BeautifulSoup(table_html, "html.parser").find("table")
+    if table is None:
+        return ""
+    caption = _visible_text(table.find("caption", recursive=False))
+    rows = [row for row in table.find_all("tr") if row.find_parent("table") is table]
+    if not rows:
+        return caption
+
+    header = table.find("thead", recursive=False)
+    header_rows = header.find_all("tr") if header else []
+    if not header_rows and all(cell.name == "th" for cell in _row_cells(rows[0])):
+        header_rows = rows[:1]
+    columns = []
+    if header_rows:
+        for cell in _row_cells(header_rows[-1]):
+            columns.extend([_visible_text(cell)] * int(cell.get("colspan", 1)))
+
+    lines = [caption] if caption else []
+    for row in rows:
+        if any(row is header_row for header_row in header_rows):
+            continue
+        cells = _row_cells(row)
+        if not cells:
+            continue
+        label = _visible_text(cells[0])
+        if len(cells) == 1:
+            if label:
+                lines.append(label)
+            continue
+
+        fields = []
+        column = int(cells[0].get("colspan", 1))
+        for cell in cells[1:]:
+            value = _visible_text(cell)
+            span = int(cell.get("colspan", 1))
+            headings = list(dict.fromkeys(h for h in columns[column:column + span] if h))
+            column += span
+            if value:
+                heading = " / ".join(headings)
+                fields.append(f"{heading}: {value}" if heading else value)
+
+        # In a wide table, continue on a new line with the same row label.
+        line = label
+        for field in fields:
+            candidate = f"{line} | {field}" if line else field
+            if len(candidate) > MAX_LINE_CHARS and line != label:
+                lines.append(line)
+                line = f"{label} | {field}" if label else field
+            else:
+                line = candidate
+        if line:
+            lines.append(line)
+    return "\n".join(lines)
+
+
+def document_metadata(file_name: str, soup: BeautifulSoup) -> dict:
+    """Read the document date and the company under coverage from its cover."""
+    company = _visible_text(soup.find("h1"))
+    subtitle = _visible_text(soup.select_one(".subtitle"))
+    first_heading = _visible_text(soup.find("h2"))
+    title = _visible_text(soup.title)
+    broker_line = _visible_text(soup.select_one(".broker"))
+    header = "\n".join((subtitle, first_heading, title))
+    if re.search(r"\bresults\s+review\b", header, re.I) or broker_line:
+        doc_type = "research_report"
+        date_pattern = r"\b(?:FY\s*)?((?:19|20)\d{2})\s+results\s+review\b"
+    elif re.search(r"\bearnings(?:\s+conference)?\s+call\b", header, re.I):
+        doc_type = "earnings_call"
+        date_pattern = r"\b(?:full\s+year|FY)\s*((?:19|20)\d{2})\b"
+    else:
+        doc_type = "annual_report"
+        date_pattern = r"\bannual\s+report\s+(?:FY\s*)?((?:19|20)\d{2})\b"
+    if doc_type != "annual_report":
+        # These two source formats append an exchange/ticker annotation to h1.
+        company = re.sub(r"\s+\([^()]+\)\s*$", "", company)
+    year = re.search(date_pattern, header, re.I)
+    if year is None:
+        year = re.search(r"\b(?:FY\s*)?((?:19|20)\d{2})\b", header, re.I)
+
+    if company:
+        _known_companies.add(company)
+    metadata = {
+        "source": file_name,
+        "company": company,
+        "fiscal_year": int(year[1]) if year else None,
+        "doc_type": doc_type,
+    }
+    if broker_line:
+        metadata["broker"] = broker_line.split("|", 1)[0].strip()
+    return metadata
+
+
+def _pack_passages(parts: list[str], heading: str = "") -> list[str]:
+    """Pack complete paragraphs or table rows, repeating the source heading."""
+    prefix = heading.strip()[:200]
+    room = MAX_CHUNK_CHARS - len(prefix) - bool(prefix)
+    passages = []
+    current = []
+    size = 0
+    for text in parts:
+        while len(text) > room:
+            boundary = text.rfind(" ", 0, room + 1)
+            split = boundary if boundary > room // 2 else room
+            if current:
+                passages.append("\n".join(current))
+                current, size = [], 0
+            passages.append(text[:split])
+            text = text[split:].lstrip()
+        if text:
+            if current and size + 1 + len(text) > room:
+                passages.append("\n".join(current))
+                current, size = [], 0
+            size += len(text) + bool(current)
+            current.append(text)
+    if current:
+        passages.append("\n".join(current))
+    return [f"{prefix}\n{passage}" if prefix else passage for passage in passages]
+
+
+def chunk_document(file_name: str, html: str) -> list[Document]:
+    """Keep tables separate and keep related paragraphs under their own heading."""
+    soup = BeautifulSoup(html, "html.parser")
+    metadata = document_metadata(file_name, soup)
+    body = soup.body or soup
+    block_names = ("h1", "h2", "h3", "h4", "p", "li", "table", "blockquote", "pre")
+    section = ""
+    paragraphs: list[str] = []
+    chunks: list[Document] = []
+
+    def emit(parts: list[str], *, caption: str = "", is_table: bool = False) -> None:
+        header = "\n".join(dict.fromkeys(filter(None, (metadata.get("broker"), section, caption))))
+        chunk_metadata = {**metadata, "section": section, "is_table": is_table}
+        if caption:
+            chunk_metadata["caption"] = caption
+        for passage in _pack_passages(parts, header):
+            chunks.append(Document(page_content=passage, metadata=chunk_metadata))
+
+    for block in body.find_all(block_names):
+        if block.find_parent((*block_names, "nav", "footer")):
+            continue
+        if block.name in ("h1", "h2", "h3", "h4"):
+            emit(paragraphs)
+            paragraphs = []
+            section = _visible_text(block)
+        elif block.name == "table":
+            emit(paragraphs)
+            paragraphs = []
+            caption = _visible_text(block.find("caption", recursive=False))
+            rows = table_to_text(str(block)).splitlines()
+            emit(rows[1:] if caption else rows, caption=caption, is_table=True)
+        else:
+            value = _visible_text(block)
+            if value:
+                paragraphs.append(value)
+    emit(paragraphs)
+    return chunks
+
+
+@dataclass
+class SearchIndex:
+    chunks: list[Document]
+    bm25: BM25Okapi | None
+    by_company: dict[str, list[int]]
+    variant: int
+
+
+# Terms that describe the question rather than the fact being looked up.
+_QUESTION_WORDS = set('''
+    what which who where how when is are was were did does do in on at as from
+    for of the a an its their and or s had has have company companies held hold
+    more higher lower greater less most fewest much many value amount number
+    end year fiscal ended financial usd millions million billion percent
+    percentage dollars dec december usd fy report reported there own
+'''.split())
+
+
+def _search_tokens(text: str) -> list[str]:
+    """Split punctuation and FY-prefixed dates without losing the year."""
+    text = unicodedata.normalize('NFKC', text).casefold()
+    text = re.sub(r'\bfy\s*(20\d{2})[ae]?\b', r'\1', text)
+    return re.findall(r"[a-z]+|\d+(?:[,.]\d+)*", text)
+
+
+def _make_search_index(chunks: list[Document], variant: int) -> SearchIndex:
+    tokens = [c.page_content.lower().split() for c in chunks]
+    groups: dict[str, list[int]] = {}
+    for i, chunk in enumerate(chunks):
+        key = company_key(chunk.metadata['company'])
+        groups.setdefault(key, []).append(i)
+    return SearchIndex(chunks, BM25Okapi(tokens) if any(tokens) else None, groups, variant)
+
+
+def build_index(chunks: list[Document]) -> SearchIndex:
+    """Index the supplied corpus in memory for lexical retrieval."""
+    return _make_search_index(chunks, variant=6)
+
+
+def _report_year(question: str, kind: str) -> int | None:
+    """A year attached to a source title can differ from the forecast year."""
+    source = {
+        'earnings_call': r'(?:earnings(?: conference)?|results) call',
+        'research_report': r'(?:results review|research report)',
+    }.get(kind)
+    if not source:
+        return None
+    year = re.search(rf'\b((?:19|20)\d{{2}}) (?:q [1-4] )?{source}\b', _plain(question))
+    return int(year[1]) if year else None
+
+
+def _scope_for_company(index: SearchIndex, key: str, parsed: dict, report_year: int | None) -> list[int]:
+    kind = parsed['doc_type']
+    year = parsed['fiscal_year']
+    scoped = []
+    for i in index.by_company.get(key, []):
+        meta = index.chunks[i].metadata
+        if meta['doc_type'] != kind:
+            continue
+        if report_year is not None and meta['fiscal_year'] != report_year:
+            continue
+        if kind == 'annual_report' and year is not None:
+            if meta['fiscal_year'] not in (year, year + 1):
+                continue
+        scoped.append(i)
+    return scoped
+
+
+def _phrase(text: str, phrase: str) -> bool:
+    return f' {phrase} ' in f' {text} '
+
+
+def _plain(text: str) -> str:
+    return ' '.join(_search_tokens(text))
+
+
+def _row_texts(chunk: Document) -> list[tuple[str, str]]:
+    return [(line.split(' | ', 1)[0], line) for line in chunk.page_content.splitlines()
+            if ' | ' in line]
+
+
+_STATEMENT_FIELDS = (
+    (r'net accounts receivable|accounts receivable net|net trade receivables|accounts receivable',
+     r'accounts receivable(?: net)?|(?:net )?trade receivables(?: net)?|net accounts receivable'),
+    (r'cash and cash equivalents|cash equivalents|cash holdings', r'cash and cash equivalents'),
+    (r'net cash (?:from|provided by) operating activities|operating cash flow',
+     r'net cash (?:from|provided by) operating activities|operating cash flow'),
+    (r'long term (?:borrowing[s]?|debt)', r'long term (?:borrowings?|debt)'),
+    (r'short term (?:borrowing[s]?|debt)', r'short term (?:borrowings?|debt)'),
+    (r'total assets', r'total assets'),
+    (r'total liabilities', r'total liabilities'),
+    (r'total (?:shareholders? )?equity', r'total (?:shareholders? )?equity'),
+    (r'inventor(?:y|ies)', r'inventor(?:y|ies)'),
+    (r'net income|net profit', r'net (?:income|profit)'),
+    (r'gross profit', r'gross profit'),
+    (r'operating (?:income|profit)', r'operating (?:income|profit)'),
+    (r'employees|headcount|number of people', r'total employees|headcount|total headcount'),
+    (r'revenues?|sales', r'(?:total )?(?:revenues?|sales)'),
+)
+
+
+def _question_focus(question: str, parsed: dict) -> str:
+    focus = _plain(question)
+    for name in sorted(parsed['companies'], key=len, reverse=True):
+        name_text = _plain(name)
+        focus = re.sub(rf'\b{re.escape(name_text)}\b', ' ', focus)
+    return ' '.join(focus.split())
+
+
+def _field_rules(focus: str) -> tuple[str | None, str | None]:
+    """Pick a row family only when the question asks for that field itself."""
+    if re.search(r'\b(?:revenues?|sales)\b', focus):
+        if re.search(r'\bsegment\b', focus):
+            return 'segment', None
+        if re.search(r'\bfrom\b|\bgenerat(?:e|ed) in [a-z]', focus):
+            return 'split', None
+    for phrase, field in _STATEMENT_FIELDS:
+        if re.search(rf'\b(?:{phrase})\b', focus):
+            return 'statement', field
+    return None, None
+
+
+def _has_year_value(line: str, year: int | None) -> bool:
+    if year is None:
+        return True
+    return any(re.search(rf'\b{year}\b', _plain(cell.split(':', 1)[0]))
+               for cell in line.split(' | ')[1:] if ':' in cell)
+
+
+def _evidence_score(chunk: Document, focus: str, parsed: dict) -> int:
+    """Boost a matching row or passage that names the requested fact."""
+    content = chunk.page_content
+    plain = _plain(content)
+    kind = parsed['doc_type']
+    year = parsed['fiscal_year']
+    meta = chunk.metadata
+    rows = _row_texts(chunk)
+    if kind == 'annual_report':
+        if re.search(r'\bchief (?:financial|executive|operating) officer\b|\b(?:cfo|ceo|coo)\b', focus):
+            if year is not None and meta['fiscal_year'] != year:
+                return 0
+            title = re.search(r'\bchief (?:financial|executive|operating) officer\b', focus)
+            role = title[0] if title else next(
+                role for acronym, role in [('cfo', 'chief financial officer'),
+                                           ('ceo', 'chief executive officer'),
+                                           ('coo', 'chief operating officer')] if _phrase(focus, acronym))
+            if any(_phrase(_plain(line), role) for _, line in rows):
+                return 5 if 'executive officers' in plain else 3
+            return 2 if _phrase(plain, role) else 0
+        if re.search(r'\baudit(?:or|ed| firm)?\b', focus):
+            if year is not None and meta['fiscal_year'] != year:
+                return 0
+            return 5 if re.search(r'\bindependent audit(?:or| firm)\b|\baudited by\b', plain) else 0
+        if re.search(r'\bheadquarter(?:s|ed)?\b|\bhead office\b', focus):
+            return 5 if re.search(r'\bheadquarter(?:s|ed)\b|\bhead office\b', plain) else 0
+
+        family, label = _field_rules(focus)
+        if family == 'statement' and label:
+            if any(re.fullmatch(label, _plain(row)) and _has_year_value(line, year) for row, line in rows):
+                return 6 if year is not None and meta['fiscal_year'] == year else 5
+            return 0
+        if family in ('segment', 'split'):
+            if 'revenue by segment' not in plain and (family == 'segment' or 'revenue by region' not in plain):
+                return 0
+            if any(_phrase(focus, _plain(row)) and _has_year_value(line, year)
+                   for row, line in rows if _plain(row) not in {'total', 'total revenue', 'revenue'}):
+                return 6 if year is not None and meta['fiscal_year'] == year else 5
+            return 0
+
+    if kind == 'research_report':
+        if re.search(r'\b(?:target price|price target)\b', focus):
+            return 6 if re.search(r'\b(?:target price|price target)\b', plain) and re.search(r'\d', content) else 0
+        if re.search(r'\brating\b|\brecommendation\b', focus):
+            return 6 if re.search(r'\brating\s+(?:buy|hold|reduce|sell|neutral|outperform|underperform)\b', plain) else 0
+        if re.search(r'\bforecast\b|\bestimat', focus):
+            _, label = _field_rules(focus)
+            if label and any(re.fullmatch(label, _plain(row)) and _has_year_value(line, year)
+                             for row, line in rows):
+                return 6
+
+    if kind == 'earnings_call':
+        if re.search(r'\brepurchase\b|\bbuyback\b', focus):
+            return 6 if re.search(r'\brepurchase\b|\bbuyback\b', plain) and re.search(r'\d', content) else 0
+        if re.search(r'\bguid\w+\b|\boutlook\b', focus):
+            year_ok = year is None or str(year) in _search_tokens(content)
+            return 6 if year_ok and re.search(r'\bguid\w+\b|\bexpect\w+\b|\boutlook\b', plain) else 0
+
+    # Unknown fields need actual words from the question, in the same sentence or row.
+    terms = set(_search_tokens(focus)) - _QUESTION_WORDS
+    terms = {word for word in terms if word.isalpha() and len(word) >= 3}
+    if not terms:
+        return 0
+    return 1 if any(terms <= set(_search_tokens(line)) for line in content.splitlines()) else 0
+
+
+def _select_chunks(index: SearchIndex, question: str) -> list[Document]:
+    if index.bm25 is None:
+        return []
+    variant = index.variant
+    query_tokens = question.lower().split()
+    lexical = index.bm25.get_scores(query_tokens)
+    all_indices = list(range(len(index.chunks)))
+    if variant < 3:
+        selected = sorted(all_indices, key=lambda i: -lexical[i])[:MAX_RETRIEVED]
+        return [index.chunks[i] for i in selected]
+
+    parsed = parse_query(question)
+    keys = list(dict.fromkeys(company_key(name) for name in parsed['companies'] if name.strip()))
+    source_year = _report_year(question, parsed['doc_type'])
+    groups = [_scope_for_company(index, key, parsed, source_year) for key in keys]
+    if variant >= 6 and (not groups or any(not group for group in groups)):
+        return []
+    scoped = list(dict.fromkeys(i for group in groups for i in group)) or all_indices
+    focus = _question_focus(question, parsed)
+    scores = {i: _evidence_score(index.chunks[i], focus, parsed) if variant >= 4 else 0
+              for i in scoped}
+    if variant >= 6:
+        groups = [[i for i in group if scores[i] > 0] for group in groups]
+        if any(not group for group in groups):
+            return []
+        scoped = [i for group in groups for i in group]
+
+    def order(pool: list[int]) -> list[int]:
+        return sorted(pool, key=lambda i: (-scores[i], -lexical[i]))
+
+    ranked = order(scoped)
+    if variant >= 5 and len(groups) > 1 and all(groups):
+        # Reserve the first available slot for each company in a comparison.
+        first = [order(group)[0] for group in groups]
+        best = first + [i for i in ranked if i not in first]
+    else:
+        best = ranked
+    return [index.chunks[i] for i in best[:MAX_RETRIEVED]]
+
+
+def retrieve(index: SearchIndex, question: str) -> list[Document]:
+    """Return up to five original chunks that support the requested fact(s)."""
+    return _select_chunks(index, question)
 
 
 # =============================================================================

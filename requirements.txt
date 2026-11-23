@@ -1,8 +1,9 @@
-langchain-core
-langchain-community
-langchain-text-splitters
-langchain-deepseek
-beautifulsoup4
-lxml
-rank-bm25
-python-dotenv
+langchain-core==1.8.2
+langchain-community==0.4.2
+langchain-text-splitters==1.1.3
+langchain-deepseek==1.2.0
+beautifulsoup4==4.15.0
+lxml==6.1.3
+rank-bm25==0.2.2
+python-dotenv==1.2.4
+regex==2026.11.7
